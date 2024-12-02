@@ -1,0 +1,328 @@
+import SimpleOpenNI.*;
+import oscP5.*;
+import netP5.*;
+import java.util.ArrayList;
+
+SimpleOpenNI kinect;
+OscP5 oscP5;
+NetAddress unityAddress;
+
+class Zone {
+    int x, y, width, height;
+
+    Zone(int x, int y, int size) {
+        this.x = x;
+        this.y = y;
+        this.width = size;
+        this.height = size;
+    }
+
+    void resize(int deltaX, int deltaY, boolean resizeX, boolean resizeY) {
+        if (resizeX) {
+            this.width += deltaX;
+            this.width = max(this.width, 10);
+        }
+        if (resizeY) {
+            this.height += deltaY;
+            this.height = max(this.height, 10);
+        }
+    }
+}
+
+Zone[] zones;
+PImage depthImage;
+int[] backgroundDepth;
+int threshold = 30;
+int maxDepth = 2000;
+int minClusterSize = 550;
+int offsetX = 10; 
+int offsetY = -80;
+
+boolean isResizing = false;
+boolean isDragging = false;
+Zone currentZone = null;
+int lastMouseX, lastMouseY;
+boolean resizeX = false;
+boolean resizeY = false;
+int resizeThreshold = 10;
+
+void setup() {
+    size(640, 480);
+    kinect = new SimpleOpenNI(this);
+    if (!kinect.enableDepth()) {
+        println("Kinect no detectado o fallo en la inicialización.");
+        exit();
+    }
+    oscP5 = new OscP5(this, 12000);
+    unityAddress = new NetAddress("127.0.0.1", 9301);
+    zones = new Zone[] {
+        new Zone(width / 2 - 50, height / 2 - 50, 100),
+        new Zone(width / 2 - 100, height / 2 - 100, 200),
+        new Zone(width / 2 - 150, height / 2 - 150, 300),
+        new Zone(width / 2 - 200, height / 2 - 200, 400)
+    };
+    captureBackground();
+    depthImage = createImage(kinect.depthWidth(), kinect.depthHeight(), RGB);
+    println("Kinect y OSC inicializados");
+}
+
+void captureBackground() {
+    kinect.update();
+    backgroundDepth = kinect.depthMap().clone();
+}
+
+void draw() {
+    background(255);
+    kinect.update();
+    int[] currentDepth = kinect.depthMap();
+    depthImage.loadPixels();
+
+    boolean[][] binaryMask = new boolean[kinect.depthHeight()][kinect.depthWidth()];
+
+    // máscara binaria
+    for (int y = 0; y < kinect.depthHeight(); y++) {
+        for (int x = 0; x < kinect.depthWidth(); x++) {
+            int index = x + y * kinect.depthWidth();
+            int currentDepthValue = currentDepth[index];
+            int backgroundDepthValue = backgroundDepth[index];
+
+            if (currentDepthValue > maxDepth || currentDepthValue == 0) {
+                depthImage.pixels[index] = color(0);
+                binaryMask[y][x] = false;
+                continue;
+            }
+
+            int depthDiff = abs(currentDepthValue - backgroundDepthValue);
+
+            if (depthDiff > threshold) {
+                binaryMask[y][x] = true;
+                depthImage.pixels[index] = color(255, 0, 0);
+            } else {
+                binaryMask[y][x] = false;
+                depthImage.pixels[index] = color(0);
+            }
+        }
+    }
+
+    // Filtrar clusters pequeños
+    boolean[][] filteredMask = filterClusters(binaryMask, minClusterSize);
+
+    // Dibujar la máscara filtrada
+    for (int y = 0; y < kinect.depthHeight(); y++) {
+        for (int x = 0; x < kinect.depthWidth(); x++) {
+            int index = x + y * kinect.depthWidth();
+            if (filteredMask[y][x]) {
+                depthImage.pixels[index] = color(255, 0, 0);
+            } else {
+                depthImage.pixels[index] = color(0);
+            }
+        }
+    }
+
+    depthImage.updatePixels();
+    image(depthImage, 0, 0);
+
+    // Enviar punto más alto al sistema OSC
+    sendHighestPoint(filteredMask);
+
+    // Dibujar zonas y enviar datos de profundidad por OSC
+    for (int zoneIndex = 0; zoneIndex < zones.length; zoneIndex++) {
+        Zone zone = zones[zoneIndex];
+        int[] nearestData = sendNearestDepthData(currentDepth, zoneIndex, zone);
+        drawDepthZones(nearestData[0], nearestData[1], zoneIndex, zone);
+    }
+}
+
+// Enviamos el punto más alto detectado al sistema OSC
+void sendHighestPoint(boolean[][] mask) {
+    int highestY = Integer.MAX_VALUE;  // Iniciar con el valor máximo de y
+    int highestX = -1;                 // Coordenada X del punto más alto
+    int highestDepth = -1;             // Profundidad del punto más alto
+
+    // Recorre la máscara para encontrar el punto más alto
+    for (int y = 0; y < mask.length; y++) {
+        for (int x = 0; x < mask[0].length; x++) {
+            if (mask[y][x]) {
+                int depthValue = kinect.depthMap()[x + y * kinect.depthWidth()];
+                if (depthValue < maxDepth && depthValue > 0 && y < highestY) {
+                    highestY = y;
+                    highestX = x;
+                    highestDepth = depthValue;  // Guardar la profundidad del punto más alto
+                }
+            }
+        }
+    }
+
+    if (highestX != -1) {
+        // Ajustar el offsetX dependiendo de la posición del objeto en el eje X
+        float screenCenterX = width / 2.0;
+        float objectDistanceFromCenterX = highestX - screenCenterX;
+        offsetX = (int)(objectDistanceFromCenterX * 0.25);  // Ajuste dinámico del offset en X
+
+        // Ajustar el offsetY dependiendo de la posición del objeto en el eje Y
+        float screenCenterY = height / 2.0;
+        float objectDistanceFromCenterY = highestY - screenCenterY;
+        offsetY = (int)(objectDistanceFromCenterY * 0.3);  // Ajuste dinámico del offset en Y
+
+        // Aplicamos los offsets en X e Y
+        highestX += offsetX;
+        highestY += offsetY;
+
+        // Enviar la posición del punto más alto (X, Y, profundidad) por OSC
+        OscMessage positionMsg = new OscMessage("/highestPosition");
+        positionMsg.add((float) highestX);  // X con offset
+        positionMsg.add((float) highestY);  // Y con offset
+        positionMsg.add((float) highestDepth);  // Profundidad
+        oscP5.send(positionMsg, unityAddress);
+    }
+}
+
+
+
+// Filtrar clusters pequeños
+boolean[][] filterClusters(boolean[][] mask, int minSize) {
+    int height = mask.length;
+    int width = mask[0].length;
+    boolean[][] visited = new boolean[height][width];
+    boolean[][] filteredMask = new boolean[height][width];
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            if (mask[y][x] && !visited[y][x]) {
+                // Etiquetar cluster usando DFS
+                ArrayList<int[]> cluster = new ArrayList<>();
+                exploreCluster(mask, visited, x, y, cluster);
+
+                // Filtra según el tamaño
+                if (cluster.size() >= minSize) {
+                    for (int[] pixel : cluster) {
+                        filteredMask[pixel[1]][pixel[0]] = true;
+                    }
+                }
+            }
+        }
+    }
+    return filteredMask;
+}
+
+// Explorar un cluster usando DFS
+void exploreCluster(boolean[][] mask, boolean[][] visited, int startX, int startY, ArrayList<int[]> cluster) {
+    int height = mask.length;
+    int width = mask[0].length;
+    ArrayList<int[]> stack = new ArrayList<>();
+    stack.add(new int[] {startX, startY});
+
+    while (!stack.isEmpty()) {
+        int[] current = stack.remove(stack.size() - 1); // Simula pop()
+        int x = current[0];
+        int y = current[1];
+
+        if (x < 0 || x >= width || y < 0 || y >= height || visited[y][x] || !mask[y][x]) {
+            continue;
+        }
+
+        visited[y][x] = true;
+        cluster.add(new int[] {x, y});
+
+        // Explorar vecinos
+        stack.add(new int[] {x + 1, y});
+        stack.add(new int[] {x - 1, y});
+        stack.add(new int[] {x, y + 1});
+        stack.add(new int[] {x, y - 1});
+    }
+}
+
+// Enviar profundidad mínima dentro de una zona
+int[] sendNearestDepthData(int[] depthMap, int zoneIndex, Zone zone) {
+    int nearestDepth = Integer.MAX_VALUE;
+    int nearestX = -1;
+
+    for (int y = zone.y; y < zone.y + zone.height; y++) {
+        for (int x = zone.x; x < zone.x + zone.width; x++) {
+            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            int index = x + (y * width);
+            int depth = depthMap[index];
+            if (depth < nearestDepth && depth > 0) {
+                nearestDepth = depth;
+                nearestX = x;
+            }
+        }
+    }
+
+    if (nearestDepth < Integer.MAX_VALUE) {
+        OscMessage msg = new OscMessage("/depthZone");
+        msg.add(nearestDepth);
+        msg.add(nearestX);
+        msg.add(zoneIndex);
+        oscP5.send(msg, unityAddress);
+    }
+
+    return new int[]{nearestDepth, nearestX};
+}
+
+// Dibujar las zonas de profundidad
+void drawDepthZones(int nearestDepth, int nearestX, int zoneIndex, Zone zone) {
+    color[] zoneColors = {color(255, 0, 0, 50), color(0, 255, 0, 50), color(0, 0, 255, 50), color(255, 255, 0, 50)};
+    fill(zoneColors[zoneIndex]);
+    rect(zone.x, zone.y, zone.width, zone.height);
+
+    if (nearestX != -1) {
+        fill(0);
+        ellipse(nearestX, zone.y + zone.height / 2, 10, 10);
+    }
+}
+
+// Funcionalidad de arrastre y redimensionado de las zonas
+void mousePressed() {
+    for (Zone zone : zones) {
+        if (mouseX > zone.x && mouseX < zone.x + zone.width &&
+            mouseY > zone.y && mouseY < zone.y + zone.height) {
+
+            if (abs(mouseX - zone.x) < resizeThreshold) {
+                resizeX = true;
+            } else if (abs(mouseX - (zone.x + zone.width)) < resizeThreshold) {
+                resizeX = true;
+            }
+
+            if (abs(mouseY - zone.y) < resizeThreshold) {
+                resizeY = true;
+            } else if (abs(mouseY - (zone.y + zone.height)) < resizeThreshold) {
+                resizeY = true;
+            }
+
+            if (!resizeX && !resizeY) {
+                isDragging = true;
+            }
+
+            currentZone = zone;
+            lastMouseX = mouseX;
+            lastMouseY = mouseY;
+            break;
+        }
+    }
+}
+
+void mouseDragged() {
+    if (currentZone != null) {
+        int deltaX = mouseX - lastMouseX;
+        int deltaY = mouseY - lastMouseY;
+
+        if (resizeX || resizeY) {
+            currentZone.resize(deltaX, deltaY, resizeX, resizeY);
+        } else if (isDragging) {
+            currentZone.x += deltaX;
+            currentZone.y += deltaY;
+        }
+
+        lastMouseX = mouseX;
+        lastMouseY = mouseY;
+    }
+}
+
+void mouseReleased() {
+    isDragging = false;
+    isResizing = false;
+    resizeX = false;
+    resizeY = false;
+    currentZone = null;
+}
